@@ -120,6 +120,7 @@
   .equ SYS_chroot,          51
   .equ SYS_fchmodat,        53
   .equ SYS_openat,          56
+  .equ SYS_unlinkat,        35
   .equ SYS_close,           57
   .equ SYS_pipe2,           59
   .equ SYS_read,            63
