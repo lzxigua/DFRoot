@@ -88,12 +88,9 @@ jobs:
 
       - name: Build DFRoot APK
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          
             ./gradlew :app:assembleDebug
-          else
-            ./gradlew :app:assembleRelease
-          fi
-
+          
       - name: Upload DFRoot APK
         uses: actions/upload-artifact@v7
         with:
