@@ -28,27 +28,34 @@ android {
         }
     }
 
-    signingConfigs {
-        create("release") {
+signingConfigs {
+    create("release") {
+        if (signingPropsFile.exists()) {
             storeFile = file(signingProps.getProperty("KEYSTORE_FILE"))
             storePassword = signingProps.getProperty("KEYSTORE_PASSWORD")
             keyAlias = signingProps.getProperty("KEY_ALIAS")
             keyPassword = signingProps.getProperty("KEY_PASSWORD")
         }
     }
+}
 
-    buildTypes {
-        debug {
-            isDebuggable = true
-            signingConfig = signingConfigs.getByName("debug")
-        }
-        release {
-            signingConfig = signingConfigs.getByName("release")
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-        }
+buildTypes {
+    debug {
+        isDebuggable = true
+        signingConfig = signingConfigs.getByName("debug")
     }
+    release {
+        signingConfig = if (signingPropsFile.exists()) {
+            signingConfigs.getByName("release")
+        } else {
+            signingConfigs.getByName("debug")
+        }
+        
+        isMinifyEnabled = false
+        isShrinkResources = false
+        proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+    }
+}
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
